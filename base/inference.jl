@@ -3930,8 +3930,8 @@ end
 # this ensures that typeinf_ext doesn't recurse before it can add the item to the workq
 
 for m in _methods_by_ftype(Tuple{typeof(typeinf_loop), Vararg{Any}}, 10)
-    typeinf_type(m[3], m[1], m[2])
+#    typeinf_type(m[3], m[1], m[2])
 end
 for m in _methods_by_ftype(Tuple{typeof(typeinf_edge), Vararg{Any}}, 10)
-    typeinf_type(m[3], m[1], m[2])
+#    typeinf_type(m[3], m[1], m[2])
 end
