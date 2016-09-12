@@ -674,7 +674,8 @@ static jl_method_instance_t *cache_method(jl_methtable_t *mt, union jl_typemap_t
             jl_svecset(limited, i, jl_wrap_vararg(lasttype, (jl_value_t*)NULL));
         }
         else {
-            jl_value_t *lastdeclt = jl_tparam(decl, jl_nparams(decl) - 1);
+            jl_value_t *unw = jl_unwrap_unionall(decl);
+            jl_value_t *lastdeclt = jl_tparam(unw, jl_nparams(unw) - 1);
             int nsp = jl_svec_len(sparams);
             if (nsp > 0) {
                 jl_svec_t *env = jl_alloc_svec_uninit(2 * nsp);
@@ -1686,15 +1687,14 @@ void jl_precompile(int all) {
     jl_compile_specializations();
 }
 
-//
-
 #ifdef JL_TRACE
 static int trace_en = 0;
 static int error_en = 1;
 static void __attribute__ ((unused)) enable_trace(int x) { trace_en=x; }
 static void show_call(jl_value_t *F, jl_value_t **args, uint32_t nargs)
 {
-    jl_printf(JL_STDOUT, "%s(",  jl_symbol_name(jl_gf_name(F)));
+    jl_static_show(JL_STDOUT, F);
+    jl_printf(JL_STDOUT, "(");
     for(size_t i=0; i < nargs; i++) {
         if (i > 0) jl_printf(JL_STDOUT, ", ");
         jl_static_show(JL_STDOUT, jl_typeof(args[i]));
@@ -1847,7 +1847,7 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t **args, uint32_t nargs)
         if (mfunc == NULL) {
 #ifdef JL_TRACE
             if (error_en)
-                show_call(F, args, nargs);
+                show_call(args[0], args, nargs);
 #endif
             jl_method_error((jl_function_t*)args[0], args, nargs);
             // unreachable
@@ -1856,7 +1856,7 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t **args, uint32_t nargs)
 
 #ifdef JL_TRACE
     if (traceen)
-        jl_printf(JL_STDOUT, " at %s:%d\n", jl_symbol_name(mfunc->file), mfunc->line);
+        jl_printf(JL_STDOUT, " at %s:%d\n", jl_symbol_name(mfunc->def->file), mfunc->def->line);
 #endif
     jl_value_t *res = jl_call_method_internal(mfunc, args, nargs);
     return verify_type(res);

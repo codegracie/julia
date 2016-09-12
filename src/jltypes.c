@@ -2620,7 +2620,7 @@ static int jl_tuple_morespecific(jl_datatype_t *cdt, jl_datatype_t *pdt, int inv
         if (ci >= clenf && !cseq)
             return 1;
         if (pi >= plenf && !pseq)
-            return some_morespecific;
+            return 0;
         if (ci < clenr) {
             ce = child[ci];
             if (jl_is_vararg_type(ce)) ce = jl_unwrap_vararg(ce);
@@ -3369,7 +3369,7 @@ void jl_init_types(void)
     jl_void_type->instance = jl_nothing;
 
     jl_datatype_t *type_type = (jl_datatype_t*)jl_type_type;
-    jl_bottomtype_type = jl_new_datatype(jl_symbol("Bottom"), type_type, jl_emptysvec,
+    jl_bottomtype_type = jl_new_datatype(jl_symbol("BottomType"), type_type, jl_emptysvec,
                                          jl_emptysvec, jl_emptysvec, 0, 0, 0);
     jl_bottom_type = jl_new_struct(jl_bottomtype_type);
     jl_bottomtype_type->instance = jl_bottom_type;
