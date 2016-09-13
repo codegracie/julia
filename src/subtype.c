@@ -2,6 +2,7 @@
 
 /*
   subtyping predicate
+  Uses the algorithm described in section 4.2.2 of https://github.com/JeffBezanson/phdthesis/
 */
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,13 @@
 #include "julia.h"
 #include "julia_internal.h"
 
+// stack of bits to keep track of which combination of Union components we are
+// looking at (0 for Union.a, 1 for Union.b). forall_exists_subtype and
+// exists_subtype loop over all combinations by updating a binary count in
+// this structure.
+// Union type decision points are discovered while the algorithm works.
+// If a new Union decision is encountered, the `more` flag is set to tell
+// the forall/exists loop to grow the stack.
 typedef struct {
     int depth;
     int8_t more;
@@ -19,27 +27,36 @@ typedef struct {
     uint32_t stack[10];
 } jl_unionstate_t;
 
+// Linked list storing the type variable environment. A new jl_varbinding_t
+// is pushed for each UnionAll type we encounter. `lb` and `ub` are updated
+// during the computation.
+// Most of the complexity is due to the "diagonal rule", requiring us to
+// identify which type vars range over only concrete types.
 typedef struct _varbinding {
     jl_tvar_t *var;
     jl_value_t *lb;
     jl_value_t *ub;
+    int8_t right;       // whether this variable came from the right side of `A <: B`
+    // if another var that this one depends on is found to be concrete, store it
+    // here for reference in case that var is popped from the environment before this one.
+    // TODO: generalize this to multiple variables
     jl_tvar_t *concretevar;
-    int8_t right;
-    int8_t occurs_inv;
-    int8_t occurs_cov;
-    int8_t concrete;
-    int depth0;
+    int8_t occurs_inv;  // occurs in invariant position
+    int8_t occurs_cov;  // # of occurrences in covariant position
+    int8_t concrete;    // 1 if another variable has a constraint forcing this one to be concrete
+    int depth0;         // # of invariant constructors nested around the UnionAll type for this var
     struct _varbinding *prev;
 } jl_varbinding_t;
 
+// subtype algorithm state
 typedef struct {
-    jl_varbinding_t *vars;
-    jl_unionstate_t Lunions;
-    jl_unionstate_t Runions;
-    jl_value_t **envout;
-    int envsz;
-    int envidx;
-    int invdepth;
+    jl_varbinding_t *vars;    // type variable environment
+    jl_unionstate_t Lunions;  // union state for unions on the left of A <: B
+    jl_unionstate_t Runions;  // union state for unions on the right
+    jl_value_t **envout;      // for passing caller the computed bounds of right-side variables
+    int envsz;                // length of envout
+    int envidx;               // current index in envout
+    int invdepth;             // current number of invariant constructors we're nested in
 } jl_stenv_t;
 
 // state manipulation utilities
@@ -84,9 +101,10 @@ static void statestack_pop(jl_unionstate_t *st)
 
 // main subtyping algorithm
 
-static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e);
+static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param);
 
-static int subtype_union(jl_value_t *t, jl_uniontype_t *u, jl_stenv_t *e, int8_t R, jl_unionstate_t *state)
+// compare the current component of `u` to `t`. `R==1` means `u` came from the right side.
+static int subtype_union(jl_value_t *t, jl_uniontype_t *u, jl_stenv_t *e, int8_t R, jl_unionstate_t *state, int param)
 {
     if (state->depth >= state->stacksize) {
         state->more = 1;
@@ -95,37 +113,42 @@ static int subtype_union(jl_value_t *t, jl_uniontype_t *u, jl_stenv_t *e, int8_t
     int ui = statestack_get(state, state->depth);
     state->depth++;
     jl_value_t *choice = ui==0 ? u->a : u->b;
-    return R ? subtype(t, choice, e) : subtype(choice, t, e);
+    return R ? subtype(t, choice, e, param) : subtype(choice, t, e, param);
 }
 
 // subtype(), but taking apart unions before handling vars
 static int subtype_ufirst(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
     if (jl_is_uniontype(x) && jl_is_typevar(y))
-        return subtype_union(y, x, e, 0, &e->Lunions);
+        return subtype_union(y, x, e, 0, &e->Lunions, 0);
     if (jl_is_typevar(x) && jl_is_uniontype(y))
         return (x == ((jl_uniontype_t*)y)->a || x == ((jl_uniontype_t*)y)->b ||
-                subtype_union(x, y, e, 1, &e->Runions));
-    return subtype(x, y, e);
+                subtype_union(x, y, e, 1, &e->Runions, 0));
+    return subtype(x, y, e, 0);
 }
 
-static void record_var_occurrence(jl_varbinding_t *vb, jl_stenv_t *e)
+// use the current context to record where a variable occurred, for the purpose
+// of determining whether the variable is concrete.
+static void record_var_occurrence(jl_varbinding_t *vb, jl_stenv_t *e, int param)
 {
-    if (e->invdepth > vb->depth0)
-        vb->occurs_inv = 1;
-    else
-        vb->occurs_cov++;
+    if (param) {
+        if (e->invdepth > vb->depth0)
+            vb->occurs_inv = 1;
+        else
+            vb->occurs_cov++;
+    }
 }
 
-static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e)
+// check that type var `b` is <: `a`, and update b's upper bound.
+static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int param)
 {
     jl_varbinding_t *bb = lookup(e, b);
     if (bb == NULL)
         return subtype_ufirst(b->ub, a, e);
-    record_var_occurrence(bb, e);
+    record_var_occurrence(bb, e, param);
     if (!bb->right)  // check ∀b . b<:a
         return subtype_ufirst(bb->ub, a, e);
-    if (!((bb->lb == jl_bottom_type && !jl_is_type(a)) || subtype_ufirst(bb->lb, a, e)))
+    if (!((bb->lb == jl_bottom_type && !jl_is_type(a) && !jl_is_typevar(a)) || subtype_ufirst(bb->lb, a, e)))
         return 0;
     // for contravariance we would need to compute a meet here, but
     // because of invariance bb.ub ⊓ a == a here always. however for this
@@ -135,6 +158,7 @@ static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e)
     return 1;
 }
 
+// quickly test that two types are identical
 static int obviously_egal(jl_value_t *a, jl_value_t *b)
 {
     if (a == b) return 1;
@@ -154,29 +178,32 @@ static int obviously_egal(jl_value_t *a, jl_value_t *b)
         return obviously_egal(((jl_uniontype_t*)a)->a, ((jl_uniontype_t*)b)->a) &&
             obviously_egal(((jl_uniontype_t*)a)->b, ((jl_uniontype_t*)b)->b);
     }
+    if (jl_is_typevar(a)) return 0;
     return !jl_is_type(a) && jl_egal(a,b);
 }
 
+// compute a least upper bound of `a` and `b`
 static jl_value_t *simple_join(jl_value_t *a, jl_value_t *b)
 {
     if (a == jl_bottom_type || b == (jl_value_t*)jl_any_type || obviously_egal(a,b))
         return b;
     if (b == jl_bottom_type || a == (jl_value_t*)jl_any_type)
         return a;
-    if (!jl_is_type(a) || !jl_is_type(b))
+    if (!(jl_is_type(a) || jl_is_typevar(a)) || !(jl_is_type(b) || jl_is_typevar(b)))
         return (jl_value_t*)jl_any_type;
     return jl_new_struct(jl_uniontype_type, a, b);
 }
 
-static int var_gt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e)
+// check that type var `b` is >: `a`, and update b's lower bound.
+static int var_gt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, int param)
 {
     jl_varbinding_t *bb = lookup(e, b);
     if (bb == NULL)
         return subtype_ufirst(a, b->lb, e);
-    record_var_occurrence(bb, e);
+    record_var_occurrence(bb, e, param);
     if (!bb->right)  // check ∀b . b>:a
         return subtype_ufirst(a, bb->lb, e);
-    if (!((bb->ub == (jl_value_t*)jl_any_type && !jl_is_type(a)) || subtype_ufirst(a, bb->ub, e)))
+    if (!((bb->ub == (jl_value_t*)jl_any_type && !jl_is_type(a) && !jl_is_typevar(a)) || subtype_ufirst(a, bb->ub, e)))
         return 0;
     bb->lb = simple_join(bb->lb, a);
     return 1;
@@ -193,6 +220,8 @@ static jl_unionall_t *rename_unionall(jl_unionall_t *u)
     return (jl_unionall_t*)t;
 }
 
+// check that a type is concrete. this is used to check concrete typevars;
+// issubtype is false if the lower bound of a concrete type var is not concrete.
 static int is_leaf_bound(jl_value_t *v)
 {
     if (v == jl_bottom_type) return 1;
@@ -216,7 +245,8 @@ static int is_leaf_bound(jl_value_t *v)
     return 0;
 }
 
-static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8_t R)
+// compare UnionAll type `u` to `t`. `R==1` if `u` came from the right side of A <: B.
+static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8_t R, int param)
 {
     jl_varbinding_t *btemp = e->vars;
     // if the var for this unionall (based on identity) already appears somewhere
@@ -229,13 +259,13 @@ static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8
         }
         btemp = btemp->prev;
     }
-    jl_varbinding_t vb = { u->var, u->var->lb, u->var->ub, NULL, R, 0, 0, 0, e->invdepth, e->vars };
+    jl_varbinding_t vb = { u->var, u->var->lb, u->var->ub, R, NULL, 0, 0, 0, e->invdepth, e->vars };
     JL_GC_PUSH2(&u, &vb.lb);
     e->vars = &vb;
     int ans;
     if (R) {
         e->envidx++;
-        ans = subtype(t, u->body, e);
+        ans = subtype(t, u->body, e, param);
         e->envidx--;
         // fill variable values into `envout` up to `envsz`
         if (e->envidx < e->envsz) {
@@ -254,7 +284,7 @@ static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8
         }
     }
     else {
-        ans = subtype(u->body, t, e);
+        ans = subtype(u->body, t, e, param);
     }
 
     // handle the "diagonal dispatch" rule, which says that a type var occurring more
@@ -321,11 +351,11 @@ static int subtype_tuple(jl_datatype_t *xd, jl_datatype_t *yd, jl_stenv_t *e)
         if (vx && !vy)
             return 0;
         if (!vx && vy) {
-            if (!subtype(xi, jl_unwrap_vararg(yi), e))
+            if (!subtype(xi, jl_unwrap_vararg(yi), e, 1))
                 return 0;
         }
         else {
-            if (!subtype(xi, yi, e))
+            if (!subtype(xi, yi, e, 1))
                 return 0;
         }
         i++;
@@ -341,14 +371,18 @@ static int subtype_tuple(jl_datatype_t *xd, jl_datatype_t *yd, jl_stenv_t *e)
         jl_value_t *N = jl_tparam1(tail);
         // only do the check if N is free in the tuple type's last parameter
         if (N != (jl_value_t*)va_p1 && N != (jl_value_t*)va_p2) {
-            if (!subtype(jl_box_long(lx+1-ly), N, e))
+            if (!subtype(jl_box_long(lx+1-ly), N, e, 1))
                 return 0;
         }
     }
     return (lx==ly && vx==vy) || (vy && (lx >= (vx ? ly : (ly-1))));
 }
 
-static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
+// `param` means we are currently looking at a parameter of a type constructor
+// (as opposed to being outside any type constructor, or comparing variable bounds).
+// this is used to record the positions where type variables occur for the
+// diagonal rule (record_var_occurrence).
+static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
 {
     if (x == jl_ANY_flag) x = (jl_value_t*)jl_any_type;
     if (y == jl_ANY_flag) y = (jl_value_t*)jl_any_type;
@@ -360,48 +394,48 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
             int xr = xx && xx->right;  // treat free variables as "forall" (left)
             int yr = yy && yy->right;
             if (xr) {
-                if (yy) record_var_occurrence(yy, e);
+                if (yy) record_var_occurrence(yy, e, param);
                 if (yr) {
                     // this is a bit odd, but seems necessary to make this case work:
                     // (UnionAll x<:T<:x RefT{RefT{T}}) == RefT{UnionAll x<:T<:x RefT{T}}
-                    return subtype(yy->ub, yy->lb, e);
+                    return subtype(yy->ub, yy->lb, e, 0);
                 }
-                return var_lt((jl_tvar_t*)x, y, e);
+                return var_lt((jl_tvar_t*)x, y, e, param);
             }
             else if (yr) {
-                if (xx) record_var_occurrence(xx, e);
-                return var_gt((jl_tvar_t*)y, x, e);
+                if (xx) record_var_occurrence(xx, e, param);
+                return var_gt((jl_tvar_t*)y, x, e, param);
             }
             jl_value_t *xub = xx ? xx->ub : ((jl_tvar_t*)x)->ub;
             jl_value_t *ylb = yy ? yy->lb : ((jl_tvar_t*)y)->lb;
             // check ∀x,y . x<:y
             // the bounds of left-side variables never change, and can only lead
             // to other left-side variables, so using || here is safe.
-            return subtype(xub, y, e) || subtype(x, ylb, e);
+            return subtype(xub, y, e, param) || subtype(x, ylb, e, param);
         }
-        return var_lt((jl_tvar_t*)x, y, e);
+        return var_lt((jl_tvar_t*)x, y, e, param);
     }
     if (jl_is_typevar(y))
-        return var_gt((jl_tvar_t*)y, x, e);
+        return var_gt((jl_tvar_t*)y, x, e, param);
     if (jl_is_uniontype(y)) {
         if (x == y || x == ((jl_uniontype_t*)y)->a || x == ((jl_uniontype_t*)y)->b)
             return 1;
         if (jl_is_unionall(x))
-            return subtype_unionall(y, (jl_unionall_t*)x, e, 0);
-        return subtype_union(x, y, e, 1, &e->Runions);
+            return subtype_unionall(y, (jl_unionall_t*)x, e, 0, param);
+        return subtype_union(x, y, e, 1, &e->Runions, param);
     }
     if (jl_is_uniontype(x)) {
         if (jl_is_unionall(y))
-            return subtype_unionall(x, (jl_unionall_t*)y, e, 1);
-        return subtype_union(y, x, e, 0, &e->Lunions);
+            return subtype_unionall(x, (jl_unionall_t*)y, e, 1, param);
+        return subtype_union(y, x, e, 0, &e->Lunions, param);
     }
     if (jl_is_unionall(y)) {
         if (x == y && !(e->envidx < e->envsz))
             return 1;
-        return subtype_unionall(x, (jl_unionall_t*)y, e, 1);
+        return subtype_unionall(x, (jl_unionall_t*)y, e, 1, param);
     }
     if (jl_is_unionall(x))
-        return subtype_unionall(y, (jl_unionall_t*)x, e, 0);
+        return subtype_unionall(y, (jl_unionall_t*)x, e, 0, param);
     if (jl_is_datatype(x) && jl_is_datatype(y)) {
         if (x == y) return 1;
         if (y == (jl_value_t*)jl_any_type) return 1;
@@ -424,11 +458,11 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
             // in Vararg{T1} <: Vararg{T2}, need to check subtype twice to
             // simulate the possibility of multiple arguments, which is needed
             // to handle the concreteness constraint correctly.
-            if (!subtype(xp1, yp1, e)) return 0;
-            if (!subtype(xp1, yp1, e)) return 0;
+            if (!subtype(xp1, yp1, e, 1)) return 0;
+            if (!subtype(xp1, yp1, e, 1)) return 0;
             // Vararg{T,N} <: Vararg{T2,N2}; equate N and N2
             e->invdepth++;
-            int ans = subtype(xp2, yp2, e) && subtype(yp2, xp2, e);
+            int ans = subtype(xp2, yp2, e, 1) && subtype(yp2, xp2, e, 0);
             e->invdepth--;
             return ans;
         }
@@ -437,7 +471,7 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
         e->invdepth++;
         for (i=0; i < np; i++) {
             jl_value_t *xi = jl_tparam(xd, i), *yi = jl_tparam(yd, i);
-            if (!(xi == yi || (subtype(xi, yi, e) && subtype(yi, xi, e)))) {
+            if (!(xi == yi || (subtype(xi, yi, e, 1) && subtype(yi, xi, e, 0)))) {
                 ans = 0; break;
             }
         }
@@ -457,7 +491,7 @@ static int exists_subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int8_t an
             statestack_set(&e->Runions, e->Runions.stacksize-1, exists);
         e->Lunions.depth = e->Runions.depth = 0;
         e->Lunions.more = e->Runions.more = 0;
-        int found = subtype(x, y, e);
+        int found = subtype(x, y, e, 0);
         if (e->Lunions.more) {
             // return up to forall_exists_subtype. the recursion must have this shape:
             // ∀₁         ∀₁
