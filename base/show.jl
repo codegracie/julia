@@ -174,13 +174,27 @@ function show(io::IO, x::Core.IntrinsicFunction)
     print(io, unsafe_string(name))
 end
 
+show(io::IO, ::Core.BottomType) = print(io, "Union{}")
+
 function show(io::IO, x::Union)
     print(io, "Union")
-    sorted_types = sort!(collect(x.types); by=string)
+    sorted_types = sort!(uniontypes(x); by=string)
     show_comma_array(io, sorted_types, '{', '}')
 end
 
+function print_without_params(x::ANY)
+    if isa(x,UnionAll)
+        b = unwrap_unionall(x)
+        return isa(b,DataType) && b.name.wrapper === x
+    end
+    return false
+end
+
 function show(io::IO, x::UnionAll)
+    has_tvar_env = get(io, :tvar_env, false) !== false
+    if has_tvar_env && print_without_params(x)
+        return show(io, unwrap_unionall(x).name)
+    end
     show(io, x.body)
     print(io, " where ")
     show(io, x.var)
@@ -201,8 +215,7 @@ function show_datatype(io::IO, x::DataType)
     # and `true` if we are printing type parameters outside a method signature.
     has_tvar_env = get(io, :tvar_env, false) !== false
 
-    if ((!isempty(x.parameters) || x.name === Tuple.name) && x !== Tuple &&
-        !(has_tvar_env && x.name.primary === x))
+    if (!isempty(x.parameters) || x.name === Tuple.name) && x !== Tuple
         n = length(x.parameters)
 
         # Print homogeneous tuples with more than 3 elements compactly as NTuple{N, T}
@@ -1043,7 +1056,7 @@ function show_lambda_types(io::IO, li::Core.MethodInstance)
             isdefined(ft.name.module, ft.name.mt.name) &&
             ft == typeof(getfield(ft.name.module, ft.name.mt.name))
         print(io, ft.name.mt.name)
-    elseif isa(ft, DataType) && is(ft.name, Type.name) && isleaftype(ft)
+    elseif isa(ft, DataType) && is(ft.name, Type.body.name) && isleaftype(ft)
         f = ft.parameters[1]
         print(io, f)
     else
@@ -1086,14 +1099,19 @@ function show(io::IO, tv::TypeVar)
         have_env = false
         in_env = false
     end
-    if !in_env && !is(tv.lb, Bottom)
-        show(io, tv.lb)
+    lb, ub = tv.lb, tv.ub
+    if !in_env && !is(lb, Bottom)
+        isa(lb,UnionAll) && print(io, "(")
+        show(io, lb)
+        isa(lb,UnionAll) && print(io, ")")
         print(io, "<:")
     end
     write(io, tv.name)
-    if have_env ? !in_env : !is(tv.ub, Any)
+    if have_env ? !in_env : !is(ub, Any)
         print(io, "<:")
-        show(io, tv.ub)
+        isa(ub,UnionAll) && print(io, "(")
+        show(io, ub)
+        isa(ub,UnionAll) && print(io, ")")
     end
     nothing
 end
@@ -1214,7 +1232,7 @@ end
 
 directsubtype(a::DataType, b::DataType) = supertype(a).name === b.name
 directsubtype(a::UnionAll, b::DataType) = directsubtype(a.body, b)
-directsubtype(a::Union, b::DataType) = any(t->directsubtype(t, b), a.types)
+directsubtype(a::Union, b::DataType) = directsubtype(a.a, b) || directsubtype(a.b, b)
 # Fallback to handle TypeVar's
 directsubtype(a, b::DataType) = false
 function dumpsubtypes(io::IO, x::DataType, m::Module, n::Int, indent)
@@ -1677,8 +1695,8 @@ end
 # returns compact, prefix
 function array_eltype_show_how(X)
     e = eltype(X)
-    if isa(e,DataType) && e === e.name.primary
-        str = string(e.name) # Print "Array" rather than "Array{T,N}"
+    if print_without_params(e)
+        str = string(unwrap_unionall(e).name) # Print "Array" rather than "Array{T,N}"
     else
         str = string(e)
     end
