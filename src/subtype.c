@@ -2,7 +2,22 @@
 
 /*
   subtyping predicate
+
   Uses the algorithm described in section 4.2.2 of https://github.com/JeffBezanson/phdthesis/
+  This code adds the following features to the core algorithm:
+
+  - Type variables can be restricted to range over only concrete types.
+    This is done by returning false if such a variable's lower bound is not concrete.
+  - Diagonal rule: a type variable is concrete if it occurs more than once in
+    covariant position, and never in invariant position. This sounds like a syntactic
+    property, but actually isn't since it depends on which occurrences of a type
+    variable the algorithm actually uses.
+  - Unconstrained type vars (Bottom<:T<:Any) can match non-type values.
+  - Vararg types have an int-valued length parameter N (in `Vararg{T,N}`).
+  - Type{T}<:S if isa(T,S). Existing code assumes this, but it's not strictly
+    correct since a type can equal `T` without having the same representation.
+  - Free type variables are tolerated. This can hopefully be removed after a
+    deprecation period.
 */
 #include <stdlib.h>
 #include <string.h>
@@ -251,6 +266,7 @@ static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8
     jl_varbinding_t *btemp = e->vars;
     // if the var for this unionall (based on identity) already appears somewhere
     // in the environment, rename to get a fresh var.
+    // TODO: might need to look inside types in btemp->lb and btemp->ub
     while (btemp != NULL) {
         if (btemp->var == u->var || btemp->lb == (jl_value_t*)u->var ||
             btemp->ub == (jl_value_t*)u->var) {
@@ -291,14 +307,14 @@ static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8
     // than once, and only in covariant position, is constrained to concrete types. E.g.
     //  ( Tuple{Int, Int}    <: Tuple{T, T} where T) but
     // !( Tuple{Int, String} <: Tuple{T, T} where T)
-    // This is done by checking that the variable's lower bound is not an abstract type.
+    // Then check concreteness by checking that the lower bound is not an abstract type.
     if (ans && (vb.concrete || (!vb.occurs_inv && vb.occurs_cov > 1))) {
         if (jl_is_typevar(vb.lb)) {
             jl_tvar_t *v = (jl_tvar_t*)vb.lb;
             jl_varbinding_t *vlb = lookup(e, v);
             if (vlb)
                 vlb->concrete = 1;
-            else  // TODO ???
+            else  // TODO handle multiple variables in vb.concretevar
                 ans = (v == vb.concretevar);
         }
         else if (!is_leaf_bound(vb.lb)) {
@@ -362,6 +378,7 @@ static int subtype_tuple(jl_datatype_t *xd, jl_datatype_t *yd, jl_stenv_t *e)
         if (j < ly-1 || !vy)
             j++;
     }
+    // TODO: handle Vararg with explicit integer length parameter
     vy = vy || (j < ly && jl_is_vararg_type(jl_tparam(yd,j)));
     if (vy && !vx && lx+1 >= ly) {
         jl_tvar_t *va_p1=NULL, *va_p2=NULL;
@@ -397,7 +414,7 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
                 if (yy) record_var_occurrence(yy, e, param);
                 if (yr) {
                     // this is a bit odd, but seems necessary to make this case work:
-                    // (UnionAll x<:T<:x RefT{RefT{T}}) == RefT{UnionAll x<:T<:x RefT{T}}
+                    // (UnionAll x<:T<:x Ref{Ref{T}}) == Ref{UnionAll x<:T<:x Ref{T}}
                     return subtype(yy->ub, yy->lb, e, 0);
                 }
                 return var_lt((jl_tvar_t*)x, y, e, param);
@@ -457,7 +474,7 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
             jl_value_t *xp1=jl_tparam0(xd), *xp2=jl_tparam1(xd), *yp1=jl_tparam0(yd), *yp2=jl_tparam1(yd);
             // in Vararg{T1} <: Vararg{T2}, need to check subtype twice to
             // simulate the possibility of multiple arguments, which is needed
-            // to handle the concreteness constraint correctly.
+            // to implement the diagonal rule correctly.
             if (!subtype(xp1, yp1, e, 1)) return 0;
             if (!subtype(xp1, yp1, e, 1)) return 0;
             // Vararg{T,N} <: Vararg{T2,N2}; equate N and N2
@@ -493,7 +510,10 @@ static int exists_subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int8_t an
         e->Lunions.more = e->Runions.more = 0;
         int found = subtype(x, y, e, 0);
         if (e->Lunions.more) {
-            // return up to forall_exists_subtype. the recursion must have this shape:
+            // If another "forall" decision is found while inside the "exists"
+            // loop, return up to forall_exists_subtype to add it to the "forall"
+            // loop. This gives the recursion the following shape, instead of
+            // simply nesting on each new decision point:
             // ∀₁         ∀₁
             //   ∃₁  =>     ∀₂
             //                ...
