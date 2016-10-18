@@ -119,8 +119,9 @@ static void statestack_pop(jl_unionstate_t *st)
 static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param);
 
 // compare the current component of `u` to `t`. `R==1` means `u` came from the right side.
-static int subtype_union(jl_value_t *t, jl_uniontype_t *u, jl_stenv_t *e, int8_t R, jl_unionstate_t *state, int param)
+static int subtype_union(jl_value_t *t, jl_uniontype_t *u, jl_stenv_t *e, int8_t R, int param)
 {
+    jl_unionstate_t *state = R ? &e->Runions : &e->Lunions;
     if (state->depth >= state->stacksize) {
         state->more = 1;
         return 1;
@@ -135,10 +136,10 @@ static int subtype_union(jl_value_t *t, jl_uniontype_t *u, jl_stenv_t *e, int8_t
 static int subtype_ufirst(jl_value_t *x, jl_value_t *y, jl_stenv_t *e)
 {
     if (jl_is_uniontype(x) && jl_is_typevar(y))
-        return subtype_union(y, x, e, 0, &e->Lunions, 0);
+        return subtype_union(y, x, e, 0, 0);
     if (jl_is_typevar(x) && jl_is_uniontype(y))
         return (x == ((jl_uniontype_t*)y)->a || x == ((jl_uniontype_t*)y)->b ||
-                subtype_union(x, y, e, 1, &e->Runions, 0));
+                subtype_union(x, y, e, 1, 0));
     return subtype(x, y, e, 0);
 }
 
@@ -350,6 +351,22 @@ static jl_value_t *unwrap_2_unionall(jl_value_t *t, jl_value_t **p1, jl_value_t 
     return t;
 }
 
+// check n <: (length of vararg type v)
+static int check_vararg_length(jl_value_t *v, ssize_t n, jl_stenv_t *e)
+{
+    jl_tvar_t *va_p1=NULL, *va_p2=NULL;
+    jl_value_t *tail = unwrap_2_unionall(v, &va_p1, &va_p2);
+    assert(jl_is_datatype(tail));
+    // in Tuple{...,tn} <: Tuple{...,Vararg{T,N}}, check (lx+1-ly) <: N
+    jl_value_t *N = jl_tparam1(tail);
+    // only do the check if N is free in the tuple type's last parameter
+    if (N != (jl_value_t*)va_p1 && N != (jl_value_t*)va_p2) {
+        if (!subtype(jl_box_long(n), N, e, 1))
+            return 0;
+    }
+    return 1;
+}
+
 static int subtype_tuple(jl_datatype_t *xd, jl_datatype_t *yd, jl_stenv_t *e)
 {
     size_t lx = jl_nparams(xd), ly = jl_nparams(yd);
@@ -381,16 +398,8 @@ static int subtype_tuple(jl_datatype_t *xd, jl_datatype_t *yd, jl_stenv_t *e)
     // TODO: handle Vararg with explicit integer length parameter
     vy = vy || (j < ly && jl_is_vararg_type(jl_tparam(yd,j)));
     if (vy && !vx && lx+1 >= ly) {
-        jl_tvar_t *va_p1=NULL, *va_p2=NULL;
-        jl_value_t *tail = unwrap_2_unionall(jl_tparam(yd,ly-1), &va_p1, &va_p2);
-        assert(jl_is_datatype(tail));
-        // in Tuple{...,tn} <: Tuple{...,Vararg{T,N}}, check (lx+1-ly) <: N
-        jl_value_t *N = jl_tparam1(tail);
-        // only do the check if N is free in the tuple type's last parameter
-        if (N != (jl_value_t*)va_p1 && N != (jl_value_t*)va_p2) {
-            if (!subtype(jl_box_long(lx+1-ly), N, e, 1))
-                return 0;
-        }
+        if (!check_vararg_length(jl_tparam(yd,ly-1), lx+1-ly, e))
+            return 0;
     }
     return (lx==ly && vx==vy) || (vy && (lx >= (vx ? ly : (ly-1))));
 }
@@ -439,12 +448,12 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, int param)
             return 1;
         if (jl_is_unionall(x))
             return subtype_unionall(y, (jl_unionall_t*)x, e, 0, param);
-        return subtype_union(x, y, e, 1, &e->Runions, param);
+        return subtype_union(x, y, e, 1, param);
     }
     if (jl_is_uniontype(x)) {
         if (jl_is_unionall(y))
             return subtype_unionall(x, (jl_unionall_t*)y, e, 1, param);
-        return subtype_union(y, x, e, 0, &e->Lunions, param);
+        return subtype_union(y, x, e, 0, param);
     }
     if (jl_is_unionall(y)) {
         if (x == y && !(e->envidx < e->envsz))
@@ -549,6 +558,19 @@ static int forall_exists_subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, in
     return 1;
 }
 
+static void init_stenv(jl_stenv_t *e, jl_value_t **env, int envsz)
+{
+    e->vars = NULL;
+    assert(env != NULL || envsz == 0);
+    e->envsz = envsz;
+    e->envout = env;
+    e->envidx = 0;
+    e->invdepth = 0;
+    e->Lunions.depth = 0;      e->Runions.depth = 0;
+    e->Lunions.more = 0;       e->Runions.more = 0;
+    e->Lunions.stacksize = 0;  e->Runions.stacksize = 0;
+}
+
 JL_DLLEXPORT int jl_subtype_env_size(jl_value_t *t)
 {
     int sz = 0;
@@ -566,15 +588,7 @@ JL_DLLEXPORT int jl_subtype_env_size(jl_value_t *t)
 JL_DLLEXPORT int jl_subtype_env(jl_value_t *x, jl_value_t *y, jl_value_t **env, int envsz)
 {
     jl_stenv_t e;
-    e.vars = NULL;
-    assert(env != NULL || envsz == 0);
-    e.envsz = envsz;
-    e.envout = env;
-    e.envidx = 0;
-    e.invdepth = 0;
-    e.Lunions.depth = 0;      e.Runions.depth = 0;
-    e.Lunions.more = 0;       e.Runions.more = 0;
-    e.Lunions.stacksize = 0;  e.Runions.stacksize = 0;
+    init_stenv(&e, env, envsz);
     return forall_exists_subtype(x, y, &e, 0);
 }
 
