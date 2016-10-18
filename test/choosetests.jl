@@ -35,6 +35,11 @@ function choosetests(choices = [])
         "checked", "intset", "floatfuncs", "compile", "parallel", "inline",
         "boundscheck", "error", "ambiguous", "cartesian", "asmvariant"
     ]
+    if startswith(string(Sys.ARCH), "arm")
+        # Remove profile from default tests on ARM since it currently segfaults
+        # Allow explicitly adding it for testing
+        filter!(x -> (x != "profile"), testnames)
+    end
 
     if Base.USE_GPL_LIBS
         testnames = [testnames, "fft", "dsp"; ]
