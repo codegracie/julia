@@ -1088,38 +1088,65 @@ static void jl_serialize_value_(jl_serializer_state *s, jl_value_t *v)
     }
 }
 
-struct jl_serialize_methcache_from_mod_env {
-    jl_serializer_state *s;
-    jl_sym_t *name;
-    jl_module_t *mod;
-};
+static void jl_serialize_missing_backedges_to_mod(jl_serializer_state *s, jl_methtable_t *mt)
+{
+    jl_array_t *backedges = mt->backedges;
+    if (backedges) {
+        size_t i, l = jl_array_len(backedges);
+        for (i = 1; i < l; i += 2) {
+            jl_method_instance_t *caller = (jl_method_instance_t*)jl_array_ptr_ref(backedges, i);
+            if (module_in_worklist(caller->def->module)) {
+                jl_serialize_value(s, caller);
+                jl_serialize_value(s, jl_array_ptr_ref(backedges, i - 1));
+            }
+        }
+    }
+}
+
+static int jl_serialize_backedges_to_mod(jl_typemap_entry_t *ml, void *closure)
+{
+    jl_serializer_state *s = (jl_serializer_state*)closure;
+    jl_method_instance_t *callee = ml->func.linfo;
+    jl_array_t *backedges = callee->backedges;
+    if (backedges) {
+        size_t i, l = jl_array_len(backedges);
+        for (i = 0; i < l; i++) {
+            jl_method_instance_t *caller = (jl_method_instance_t*)jl_array_ptr_ref(backedges, i);
+            if (module_in_worklist(caller->def->module)) {
+                jl_serialize_value(s, caller);
+                jl_serialize_value(s, callee);
+            }
+        }
+    }
+    return 1;
+}
 
 static int jl_serialize_methcache_from_mod(jl_typemap_entry_t *ml, void *closure)
 {
-    struct jl_serialize_methcache_from_mod_env *env = (struct jl_serialize_methcache_from_mod_env*)closure;
-    if (module_in_worklist(ml->func.method->module)) {
-        jl_serialize_value(env->s, ml->func.method);
-        jl_serialize_value(env->s, ml->simplesig);
+    jl_serializer_state *s = (jl_serializer_state*)closure;
+    jl_method_t *m = ml->func.method;
+    if (module_in_worklist(m->module)) {
+        jl_serialize_value(s, m);
+        jl_serialize_value(s, ml->simplesig);
+    }
+    else {
+        jl_typemap_visitor(m->specializations, jl_serialize_backedges_to_mod, closure);
     }
     return 1;
 }
 
 static void jl_serialize_methtable_from_mod(jl_serializer_state *s, jl_typename_t *tn)
 {
-    struct jl_serialize_methcache_from_mod_env env;
-    env.s = s;
-    env.mod = tn->module;
-    env.name = tn->name;
-    assert(tn->module);
-    jl_typemap_visitor(tn->mt->defs, jl_serialize_methcache_from_mod, &env);
+    jl_typemap_visitor(tn->mt->defs, jl_serialize_methcache_from_mod, (void*)s);
 }
 
 static void jl_serialize_lambdas_from_mod(jl_serializer_state *s, jl_module_t *m)
 {
-    if (module_in_worklist(m)) return;
+    if (module_in_worklist(m))
+        return;
     size_t i;
     void **table = m->bindings.table;
-    for(i=1; i < m->bindings.size; i+=2) {
+    for (i = 1; i < m->bindings.size; i += 2) {
         if (table[i] != HT_NOTFOUND) {
             jl_binding_t *b = (jl_binding_t*)table[i];
             if (b->owner == m && b->value && b->constp) {
@@ -1127,8 +1154,11 @@ static void jl_serialize_lambdas_from_mod(jl_serializer_state *s, jl_module_t *m
                     jl_typename_t *tn = ((jl_datatype_t*)b->value)->name;
                     if (tn->module == m && tn->name == b->name) {
                         jl_methtable_t *mt = tn->mt;
-                        if (mt != NULL && (jl_value_t*)mt != jl_nothing && (mt != jl_type_type_mt || tn == jl_type_type->name)) {
+                        if (mt != NULL &&
+                                (jl_value_t*)mt != jl_nothing &&
+                                (mt != jl_type_type_mt || tn == jl_type_type->name)) {
                             jl_serialize_methtable_from_mod(s, tn);
+                            jl_serialize_missing_backedges_to_mod(s, mt);
                         }
                     }
                 }
@@ -1150,7 +1180,7 @@ static void write_mod_list(ios_t *s)
     jl_module_t *m = jl_main_module;
     size_t i;
     void **table = m->bindings.table;
-    for(i=1; i < m->bindings.size; i+=2) {
+    for (i = 1; i < m->bindings.size; i += 2) {
         if (table[i] != HT_NOTFOUND) {
             jl_binding_t *b = (jl_binding_t*)table[i];
             if (b->owner == m &&
@@ -1934,9 +1964,15 @@ static jl_value_t *jl_deserialize_value_(jl_serializer_state *s, jl_value_t *vta
 
 typedef struct _linkedlist_t {
     struct _linkedlist_t *next;
-    struct {
-        jl_method_t *meth;
-        jl_tupletype_t *simpletype;
+    union {
+        struct {
+            jl_method_t *meth;
+            jl_tupletype_t *simpletype;
+        };
+        struct {
+            jl_method_instance_t *caller;
+            jl_value_t *callee;
+        };
     } def[100];
     size_t count;
 } linkedlist_t;
@@ -1969,10 +2005,25 @@ static void jl_insert_methods(linkedlist_t *list)
     while (list) {
         size_t i;
         for (i = 0; i < list->count; i++) {
-            jl_method_t *meth = list->def[i].meth;
-            jl_datatype_t *gf = jl_first_argument_datatype((jl_value_t*)meth->sig);
-            assert(jl_is_datatype(gf) && gf->name->mt);
-            jl_method_table_insert(gf->name->mt, meth, list->def[i].simpletype);
+            if (jl_is_method(list->def[i].meth)) {
+                jl_method_t *meth = list->def[i].meth;
+                jl_datatype_t *gf = jl_first_argument_datatype((jl_value_t*)meth->sig);
+                assert(jl_is_datatype(gf) && gf->name->mt);
+                jl_method_table_insert(gf->name->mt, meth, list->def[i].simpletype);
+            }
+            else {
+                jl_method_instance_t *caller = list->def[i].caller;
+                assert(jl_is_method_instance(caller));
+                jl_value_t *callee = list->def[i].callee;
+                if (jl_is_method_instance(callee)) {
+                    jl_method_instance_add_backedge((jl_method_instance_t*)callee, caller);
+                }
+                else {
+                    jl_datatype_t *gf = jl_first_argument_datatype(callee);
+                    assert(jl_is_datatype(gf) && gf->name->mt);
+                    jl_method_table_add_backedge(gf->name->mt, callee, (jl_value_t*)caller);
+                }
+            }
         }
         list = list->next;
     }
