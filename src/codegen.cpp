@@ -5912,27 +5912,40 @@ static inline std::string getNativeTarget()
 #if defined(_CPU_ARM_) || defined(_CPU_AARCH64_)
 // Check if the cpu name is a ARM/AArch64 arch name and return a
 // string that can be used as LLVM feature name
-static inline std::string checkARMArchFeature(const std::string &cpu)
+static inline void checkARMArchFeature(std::string &cpu,
+                                       StringMap<bool> &HostFeatures)
 {
-    const char *prefix = "armv";
-    size_t prefix_len = strlen(prefix);
-    if (cpu.size() <= prefix_len ||
-        memcmp(cpu.data(), prefix, prefix_len) != 0 ||
-        cpu[prefix_len] < '1' || cpu[prefix_len] > '9')
-        return std::string();
 #if defined(_CPU_ARM_)
+    if (cpu == "generic") {
+        HostFeatures["neon"] = false;
+        return;
+    }
+#endif
+    StringRef cpu_s = cpu;
+    if (!cpu_s.startswith("armv"))
+        return;
+    // Generic names
+#if defined(_CPU_ARM_)
+    if (!cpu_s.startswith("armv8")) {
+        // Turn off `neon` for generic archs on ARM
+        // since LLVM seems to enable it for all armv7-a processors.
+        HostFeatures["neon"] = false;
+    }
     // "v7" and "v8" are not available in the form of `armv*`
     // in the feature list
     if (cpu == "armv7") {
-        return "v7";
+        HostFeatures["v7"] = true;
     }
     else if (cpu == "armv8") {
-        return "v8";
+        HostFeatures["v8"] = true;
     }
-    return cpu;
+    else {
+        HostFeatures[cpu] = true;
+    }
 #else
-    return cpu.substr(3);
+    HostFeatures[cpu.substr(3)] = true;
 #endif
+    cpu = "generic";
 }
 #endif
 
@@ -5995,7 +6008,8 @@ static inline SmallVector<std::string,10> getTargetFeatures(std::string &cpu)
     // doesn't support setting profiles.
     // AFAIK there's currently no 64bit R and M profile either
     // (v8r and v8m are both 32bit)
-#if defined(__ARM_ARCH_PROFILE)
+    // Disable this for now since LLVM seems to treat any aclass as having neon.
+#if 0 && defined(__ARM_ARCH_PROFILE)
 #  if __ARM_ARCH_PROFILE == 'A'
     HostFeatures["aclass"] = true;
 #  elif __ARM_ARCH_PROFILE == 'R'
@@ -6019,11 +6033,7 @@ static inline SmallVector<std::string,10> getTargetFeatures(std::string &cpu)
     //
     // Supported AArch64 arch names on LLVM 3.8:
     //   armv8.1a, armv8.2a
-    std::string arm_arch = checkARMArchFeature(cpu);
-    if (!arm_arch.empty()) {
-        HostFeatures[arm_arch] = true;
-        cpu = "generic";
-    }
+    checkARMArchFeature(cpu, HostFeatures);
 #endif
 
     SmallVector<std::string,10> attr;
