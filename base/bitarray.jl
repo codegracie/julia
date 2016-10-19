@@ -57,6 +57,18 @@ const _msk64 = ~UInt64(0)
 @inline _msk_end(B::BitArray) = _msk_end(length(B))
 num_bit_chunks(n::Int) = _div64(n+63)
 
+function _check_bitarray_consistency{N}(B::BitArray{N})
+    n = length(B)
+    all(d ≥ 0 for d in B.dims) || return false
+    N ≠ 1 && prod(B.dims) ≠ n && return false
+    Bc = B.chunks
+    nc = length(Bc)
+    nc == num_bit_chunks(n) || return false
+    n == 0 && return true
+    Bc[end] & _msk_end(n) == Bc[end] || return false
+    return true
+end
+
 @inline get_chunks_id(i::Integer) = _div64(Int(i)-1)+1, _mod64(Int(i)-1)
 
 function glue_src_bitchunks(src::Vector{UInt64}, k::Int, ks1::Int, msk_s0::UInt64, ls0::Int)
